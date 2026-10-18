@@ -1,0 +1,12 @@
+# kube-apiserver --audit-policy-file=... --audit-log-path=/var/log/kubernetes/audit.log
+apiVersion: audit.k8s.io/v1
+kind: Policy
+omitStages: ["RequestReceived"]
+rules:
+  - level: RequestResponse
+    resources: [{ group: "", resources: ["secrets","serviceaccounts"] }, { group: "rbac.authorization.k8s.io" }]
+  - level: Metadata
+    resources: [{ group: "apps" }, { group: "" , resources: ["pods","pods/exec"] }]
+  - level: None
+    users: ["system:kube-proxy"]
+  - level: Metadata

@@ -1,0 +1,34 @@
+# Least-privilege RBAC. The CI deployer can only manage Deployments/Services in one namespace.
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: app-sa, namespace: secure-app }
+automountServiceAccountToken: false
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata: { name: ci-deployer, namespace: secure-app }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: deployer, namespace: secure-app }
+rules:
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get","list","create","update","patch"]
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get","list","create","update","patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata: { name: deployer-binding, namespace: secure-app }
+subjects: [{ kind: ServiceAccount, name: ci-deployer, namespace: secure-app }]
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: deployer }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata: { name: auditor, namespace: secure-app }
+rules:
+  - apiGroups: ["", "apps", "wgpolicyk8s.io"]
+    resources: ["pods","deployments","policyreports"]
+    verbs: ["get","list","watch"]

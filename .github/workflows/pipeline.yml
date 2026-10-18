@@ -1,0 +1,153 @@
+name: zero-trust-supply-chain
+on:
+  push: { branches: [main] }
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      image_dir:
+        description: "Build context (app or compromised-test)"
+        default: app
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE: ghcr.io/${{ github.repository }}/secure-app
+  CTX: ${{ github.event.inputs.image_dir || 'app' }}
+
+permissions: { contents: read }
+
+jobs:
+  secret-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: "${{ secrets.GITHUB_TOKEN }}" }
+
+  sast:
+    runs-on: ubuntu-latest
+    container: { image: "semgrep/semgrep:latest" }
+    steps:
+      - uses: actions/checkout@v4
+      - run: semgrep scan --config auto --error --severity ERROR .
+
+  dependency-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: ${{ env.CTX }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          ignore-unfixed: true
+
+  build-scan-sign:
+    needs: [secret-scan, sast, dependency-scan]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      id-token: write          # OIDC for keyless signing + Vault
+      security-events: write
+    outputs:
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: "${{ github.actor }}", password: "${{ secrets.GITHUB_TOKEN }}" }
+
+      - name: Build (local, not pushed)
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CTX }}
+          load: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+
+      - name: Trivy image scan (gate)
+        id: trivy
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ github.sha }}
+          severity: HIGH,CRITICAL
+          exit-code: "1"
+          format: sarif
+          output: trivy.sarif
+
+      - name: Generate SBOM (CycloneDX)
+        if: always()
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ github.sha }}
+          format: cyclonedx-json
+          output-file: sbom.cdx.json
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: security-reports, path: "trivy.sarif\nsbom.cdx.json" }
+
+      - name: Push (only reached if scans passed)
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ env.CTX }}
+          push: true
+          tags: ${{ env.IMAGE }}:${{ github.sha }}
+          provenance: mode=max
+
+      - uses: sigstore/cosign-installer@v3
+      - name: Sign image + attest SBOM (keyless, OIDC)
+        run: |
+          cosign sign --yes ${IMAGE}@${{ steps.push.outputs.digest }}
+          cosign attest --yes --type cyclonedx --predicate sbom.cdx.json ${IMAGE}@${{ steps.push.outputs.digest }}
+
+  dast:
+    needs: build-scan-sign
+    runs-on: ubuntu-latest
+    steps:
+      - run: docker run -d --name app -p 8080:8080 ${IMAGE}@${{ needs.build-scan-sign.outputs.digest }}
+      - uses: zaproxy/action-baseline@v0.12.0
+        with: { target: "http://localhost:8080", fail_action: true }
+
+  deploy:
+    needs: [build-scan-sign, dast]
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: sigstore/cosign-installer@v3
+      - name: Verify signature + SBOM attestation before deploy
+        run: ./scripts/verify-artifact.sh "${IMAGE}@${{ needs.build-scan-sign.outputs.digest }}" "${{ github.repository }}"
+
+      - name: Short-lived secrets from Vault (OIDC/JWT, no static creds)
+        uses: hashicorp/vault-action@v3
+        with:
+          url: ${{ secrets.VAULT_ADDR }}
+          method: jwt
+          role: github-cicd
+          secrets: |
+            kv/data/cicd/k8s kubeconfig | KUBECONFIG_DATA ;
+
+      - name: Deploy (admission controller re-verifies at the cluster)
+        run: |
+          echo "$KUBECONFIG_DATA" > "$RUNNER_TEMP/kc" && export KUBECONFIG="$RUNNER_TEMP/kc"
+          sed "s#IMAGE_PLACEHOLDER#${IMAGE}@${{ needs.build-scan-sign.outputs.digest }}#" k8s/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/
+
+  alert-on-failure:
+    needs: [secret-scan, sast, dependency-scan, build-scan-sign, dast, deploy]
+    if: failure()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Record audit event + alert security admins
+        env: { SLACK_WEBHOOK: "${{ secrets.SLACK_WEBHOOK }}" }
+        run: |
+          ./scripts/audit.sh "PIPELINE_REJECTED" "run=${{ github.run_id }} sha=${{ github.sha }} actor=${{ github.actor }}"
+          ./scripts/alert.sh "Artifact REJECTED: ${{ github.repository }}@${{ github.sha }} (run ${{ github.run_id }})"
+      - uses: actions/upload-artifact@v4
+        with: { name: audit-log, path: audit.log }

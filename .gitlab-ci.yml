@@ -1,0 +1,10 @@
+stages: [scan, build, sign, dast, deploy]
+secrets:   { stage: scan,  image: zricethezav/gitleaks, script: [gitleaks detect -s . --exit-code 1] }
+sast:      { stage: scan,  image: semgrep/semgrep, script: [semgrep scan --config auto --error .] }
+build:     { stage: build, image: docker:27, services: [docker:27-dind],
+             script: [docker build -t $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA app,
+                      trivy image --severity HIGH,CRITICAL --exit-code 1 $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA,
+                      docker push $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA] }
+sign:      { stage: sign,  id_tokens: { SIGSTORE_ID_TOKEN: { aud: sigstore } },
+             script: [cosign sign --yes $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA] }
+deploy:    { stage: deploy, script: [./scripts/verify-artifact.sh $CI_REGISTRY_IMAGE:$CI_COMMIT_SHA $CI_PROJECT_PATH, kubectl apply -f k8s/], environment: production }
